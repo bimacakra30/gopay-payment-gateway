@@ -29,12 +29,16 @@ async function verifyPayment(amount, startTime, merchantIdOverride = null, userA
         if (startTime) {
             const parsed = new Date(startTime);
             startTimeISO = isNaN(parsed.getTime())
-                ? new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString()
+                ? new Date(now.getTime() - 10 * 60 * 1000).toISOString()  // Fallback: 10 menit (sesuai QRIS expiry)
                 : parsed.toISOString();
         } else {
-            startTimeISO = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+            // Tanpa startTime, hanya cek 10 menit terakhir (sesuai QRIS expiry)
+            // Ini mencegah match dengan transaksi lama yang nominal sama
+            startTimeISO = new Date(now.getTime() - 10 * 60 * 1000).toISOString();
         }
         const endTimeISO = now.toISOString();
+
+        logActivity('DEBUG', `verifyPayment fetch: amount=${amount}, startTime=${startTimeISO}, qrisId=${qrisId}`);
 
         return await gopayRequest({
             method: 'get',
@@ -73,7 +77,13 @@ async function verifyPayment(amount, startTime, merchantIdOverride = null, userA
 
     const rawTransactions = response.data?.transactions || response.data?.data?.transactions || response.data?.data || [];
     const targetAmount = parseInt(amount, 10);
-    const filterStartTimeMs = startTime ? new Date(startTime).getTime() : 0;
+    // PENTING: Jika startTime tidak ada, gunakan 10 menit lalu sebagai batas bawah
+    // JANGAN pernah set ke 0 (artinya match semua transaksi sepanjang waktu)
+    const filterStartTimeMs = startTime 
+        ? new Date(startTime).getTime() 
+        : Date.now() - 10 * 60 * 1000;
+
+    logActivity('DEBUG', `verifyPayment matching: targetAmount=${targetAmount}, filterStart=${new Date(filterStartTimeMs).toISOString()}, qrisId=${qrisId}, txCount=${rawTransactions.length}`);
 
     for (const tx of rawTransactions) {
         const rawAmount = parseInt(tx.gross_amount || tx.real_gross_amount || tx.amount?.value || tx.amount || 0, 10);
@@ -81,40 +91,52 @@ async function verifyPayment(amount, startTime, merchantIdOverride = null, userA
         const txTimestamp = new Date(tx.transaction_time || tx.created_at || tx.settlement_time || 0).getTime();
         const txId = tx.id || tx.order_id || tx.wallstreet_transaction_id;
 
-        if (txAmount === targetAmount && txTimestamp >= filterStartTimeMs) {
-            const existingClaim = claimStore.get(txId);
+        // Skip jika nominal tidak cocok
+        if (txAmount !== targetAmount) {
+            continue;
+        }
 
-            if (pendingClaims.has(txId)) {
-                logActivity('INFO', `TRX ${txId} sedang diproses klaim oleh request lain, skip`);
-                continue;
-            }
+        // Skip jika transaksi terjadi SEBELUM QRIS dibuat
+        if (txTimestamp < filterStartTimeMs) {
+            logActivity('DEBUG', `TRX ${txId} amount=${txAmount} SKIP: terjadi sebelum QRIS dibuat (tx=${new Date(txTimestamp).toISOString()} < filter=${new Date(filterStartTimeMs).toISOString()})`);
+            continue;
+        }
 
-            if (!existingClaim) {
-                pendingClaims.add(txId);
-                claimStore.set(txId, { qrisId, claimedAt: Date.now() });
-                pendingClaims.delete(txId);
-                logActivity('INFO', `TRX ${txId} diklaim oleh QRIS ${qrisId || 'manual-check'}`);
-                return {
-                    transaction_id: txId,
-                    order_id: tx.order_id,
-                    amount: txAmount,
-                    payer_issuer: tx.qris_provider_aspi_issuer || 'GoPay / Bank',
-                    payment_type: tx.payment_type || tx.transaction_source || 'GOPAY_INSTORE',
-                    transaction_time: tx.transaction_time || tx.settlement_time
-                };
-            } else if (qrisId && existingClaim.qrisId === qrisId) {
-                return {
-                    transaction_id: txId,
-                    order_id: tx.order_id,
-                    amount: txAmount,
-                    payer_issuer: tx.qris_provider_aspi_issuer || 'GoPay / Bank',
-                    payment_type: tx.payment_type || tx.transaction_source || 'GOPAY_INSTORE',
-                    transaction_time: tx.transaction_time || tx.settlement_time
-                };
-            } else {
-                logActivity('INFO', `TRX ${txId} sudah diklaim oleh QRIS ${existingClaim.qrisId || 'lain'}, skip untuk QRIS ${qrisId}`);
-                continue;
-            }
+        const existingClaim = claimStore.get(txId);
+
+        if (pendingClaims.has(txId)) {
+            logActivity('INFO', `TRX ${txId} sedang diproses klaim oleh request lain, skip`);
+            continue;
+        }
+
+        if (!existingClaim) {
+            // Belum diklaim siapapun — klaim untuk QRIS ini
+            pendingClaims.add(txId);
+            claimStore.set(txId, { qrisId, claimedAt: Date.now() });
+            pendingClaims.delete(txId);
+            logActivity('INFO', `TRX ${txId} diklaim oleh QRIS ${qrisId || 'manual-check'} (amount=${txAmount}, txTime=${new Date(txTimestamp).toISOString()})`);
+            return {
+                transaction_id: txId,
+                order_id: tx.order_id,
+                amount: txAmount,
+                payer_issuer: tx.qris_provider_aspi_issuer || 'GoPay / Bank',
+                payment_type: tx.payment_type || tx.transaction_source || 'GOPAY_INSTORE',
+                transaction_time: tx.transaction_time || tx.settlement_time
+            };
+        } else if (qrisId && existingClaim.qrisId === qrisId) {
+            // Sudah diklaim oleh QRIS yang sama (idempotent) — return lagi
+            logActivity('DEBUG', `TRX ${txId} sudah diklaim oleh QRIS sama (${qrisId}), return ulang`);
+            return {
+                transaction_id: txId,
+                order_id: tx.order_id,
+                amount: txAmount,
+                payer_issuer: tx.qris_provider_aspi_issuer || 'GoPay / Bank',
+                payment_type: tx.payment_type || tx.transaction_source || 'GOPAY_INSTORE',
+                transaction_time: tx.transaction_time || tx.settlement_time
+            };
+        } else {
+            logActivity('INFO', `TRX ${txId} sudah diklaim oleh QRIS ${existingClaim.qrisId || 'lain'}, skip untuk QRIS ${qrisId}`);
+            continue;
         }
     }
     return null;
