@@ -3,7 +3,7 @@ const path = require('path');
 const { logActivity } = require('../utils/logger');
 
 const STORE_FILE = path.join(__dirname, '../../data/qris_store.json');
-const QRIS_EXPIRY_MS = 5 * 60 * 1000;
+const QRIS_EXPIRY_MS = 10 * 60 * 1000;
 
 function ensureDataDir() {
     const dir = path.dirname(STORE_FILE);
